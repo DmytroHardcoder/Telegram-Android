@@ -12,7 +12,7 @@ concurrency:
 
 env:
   ABI: armeabi-v7a
-  FLAVOR: Armv7
+  FLAVOR: Standalone
   # На ubuntu-24.04 є 16GB RAM. Віддаємо 9GB під Gradle/R8, вмикаємо паралельний GC
   GRADLE_OPTS: >-
     -Dorg.gradle.daemon=false
@@ -83,7 +83,6 @@ jobs:
               -dname "CN=Telegram, OU=Android, O=Telegram, L=Kyiv, S=Kyiv, C=UA"
           fi
 
-          # DrKLO шукає keystore у TMessagesProj/config/release.keystore та змінні в gradle.properties
           mkdir -p TMessagesProj/config
           cp -f release.keystore TMessagesProj/config/release.keystore
           cat << EOF >> gradle.properties
@@ -161,12 +160,22 @@ jobs:
                   def android = p.extensions.findByName('android')
                   if (android == null) return
 
+                  def isApp = p.plugins.hasPlugin('com.android.application')
+
                   // 2. ТІЛЬКИ дефолтний конфіг (вшитий у values/) та Українська ('uk'). Ніяких 'en'!
-                  android.defaultConfig.resConfigs("uk")
+                  if (isApp) {
+                      android.defaultConfig.resConfigs("uk")
+                  }
 
                   // 3. Жорсткий лок на 32-бітний armv7
                   android.defaultConfig.ndk.abiFilters.clear()
                   android.defaultConfig.ndk.abiFilters.add('armeabi-v7a')
+                  android.productFlavors.all { flavor ->
+                      try {
+                          flavor.ndk.abiFilters.clear()
+                          flavor.ndk.abiFilters.add('armeabi-v7a')
+                      } catch (ignored) {}
+                  }
                   if (android.hasProperty('splits')) {
                       android.splits.abi.enable = false
                       android.splits.density.enable = false
@@ -195,25 +204,28 @@ jobs:
                       ]
                   }
 
-                  // 5. R8 / ProGuard на максималках
-                  android.buildTypes.matching { it.name == 'release' }.all { bt ->
-                      bt.minifyEnabled = true
-                      bt.shrinkResources = true
-                      bt.crunchPngs = true
+                  // 5. R8 / ProGuard на максималках (shrinkResources дозволений тільки для com.android.application)
+                  android.buildTypes.matching { it.name == 'release' || it.name == 'standalone' || it.name == 'HA_public' }.all { bt ->
                       bt.debuggable = false
                       bt.jniDebuggable = false
                       bt.renderscriptDebuggable = false
                       bt.pseudoLocalesEnabled = false
-                      bt.ndk.debugSymbolLevel = 'NONE'
+                      try { bt.ndk.debugSymbolLevel = 'NONE' } catch (ignored) {}
 
-                      // Підміняємо дефолтний proguard-android.txt на агресивний optimize
-                      def currentFiles = bt.proguardFiles.findAll { !it.name.contains('proguard-android.txt') }
-                      bt.setProguardFiles(currentFiles)
-                      bt.proguardFile(android.getDefaultProguardFile('proguard-android-optimize.txt'))
+                      if (isApp) {
+                          bt.minifyEnabled = true
+                          bt.shrinkResources = true
+                          bt.crunchPngs = true
+
+                          // Підміняємо дефолтний proguard-android.txt на агресивний optimize
+                          def currentFiles = bt.proguardFiles.findAll { !it.name.contains('proguard-android.txt') }
+                          bt.setProguardFiles(currentFiles)
+                          bt.proguardFile(android.getDefaultProguardFile('proguard-android-optimize.txt'))
+                      }
                   }
 
                   // 6. Нативна м'ясорубка (Clang + LLD + ThinLTO + ARMv7 NEON + Thumb-2)
-                  def terminatorFlags = [
+                  def terminatorFlagsList = [
                       '-O3',
                       '-mthumb',                        // Компактний 16/32-bit Thumb-2 код без втрати швидкості
                       '-march=armv7-a',
@@ -230,7 +242,8 @@ jobs:
                       '-fno-asynchronous-unwind-tables',
                       '-DNDEBUG',
                       '-g0'                             // Нуль дебаг-інфи на рівні компілятора
-                  ].join(' ')
+                  ]
+                  def terminatorFlags = terminatorFlagsList.join(' ')
 
                   def terminatorLinker = [
                       '-fuse-ld=lld',
@@ -244,16 +257,38 @@ jobs:
                       '-Wl,--build-id=none'             // Прибирає хеш білда з заголовка ELF
                   ].join(' ')
 
-                  android.defaultConfig.externalNativeBuild.cmake.with {
-                      cFlags += " ${terminatorFlags}"
-                      cppFlags += " ${terminatorFlags}"
-                      arguments '-DANDROID_STL=c++_static',
-                                '-DANDROID_ARM_NEON=TRUE',
-                                '-DCMAKE_BUILD_TYPE=Release',
-                                "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
-                                "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
-                                "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
-                                "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
+                  if (android.externalNativeBuild?.cmake?.path != null) {
+                      android.defaultConfig.externalNativeBuild.cmake.with {
+                          cFlags.addAll(terminatorFlagsList)
+                          cppFlags.addAll(terminatorFlagsList)
+                          arguments.addAll([
+                              '-DANDROID_STL=c++_static',
+                              '-DANDROID_ARM_NEON=TRUE',
+                              '-DCMAKE_BUILD_TYPE=Release',
+                              "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
+                              "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
+                              "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
+                              "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
+                          ])
+                      }
+                  }
+
+                  // 7. Авто-аліас таски збірки, якщо флейвор називається armv7/afat замість Standalone
+                  if (isApp) {
+                      p.tasks.addRule("Pattern: assemble<Flavor>Release") { String taskName ->
+                          if (taskName == "assembleStandaloneRelease" || taskName == "assembleArmv7Release") {
+                              p.tasks.register(taskName) { t ->
+                                  def candidates = p.tasks.matching {
+                                      it.name.startsWith("assemble") &&
+                                      it.name != taskName &&
+                                      !it.name.contains("Test") &&
+                                      (it.name.toLowerCase().contains("armv7") || it.name.toLowerCase().contains("standalone") || it.name.toLowerCase().contains("afat") || it.name == "assembleRelease") &&
+                                      (it.name.toLowerCase().contains("release") || it.name.toLowerCase().contains("standalone"))
+                                  }
+                                  t.dependsOn(candidates)
+                              }
+                          }
+                      }
                   }
               }
           }
