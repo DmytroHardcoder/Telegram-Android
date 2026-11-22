@@ -2,6 +2,7 @@ name: Release Telegram (ARMv7 Terminator)
 
 on:
   push:
+    branches: ['master', 'main']
     tags: ['v*']
   workflow_dispatch:
 
@@ -11,7 +12,7 @@ concurrency:
 
 env:
   ABI: armeabi-v7a
-  FLAVOR: Standalone
+  FLAVOR: Armv7
   # На ubuntu-24.04 є 16GB RAM. Віддаємо 9GB під Gradle/R8, вмикаємо паралельний GC
   GRADLE_OPTS: >-
     -Dorg.gradle.daemon=false
@@ -61,17 +62,84 @@ jobs:
           ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
           ccache -z
 
-      - name: Inject Secrets
+      - name: Inject Secrets (with DrKLO fallbacks)
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
           GSERVICES_B64: ${{ secrets.GOOGLE_SERVICES_B64 }}
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
-          echo "$KEYSTORE_B64"  | base64 -d > release.keystore
-          echo "$GSERVICES_B64" | base64 -d > TMessagesProj/google-services.json
-          sed -i "s/APP_ID = .*;/APP_ID = ${{ secrets.TG_API_ID }};/" \
-            TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
-          sed -i "s/APP_HASH = \".*\";/APP_HASH = \"${{ secrets.TG_API_HASH }}\";/" \
-            TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          PASS="${KS_PASS:-android}"
+          ALIAS="${KEY_ALIAS:-androiddebugkey}"
+
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > release.keystore
+          else
+            keytool -genkeypair -v -keystore release.keystore -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Telegram, OU=Android, O=Telegram, L=Kyiv, S=Kyiv, C=UA"
+          fi
+
+          # DrKLO шукає keystore у TMessagesProj/config/release.keystore та змінні в gradle.properties
+          mkdir -p TMessagesProj/config
+          cp -f release.keystore TMessagesProj/config/release.keystore
+          cat << EOF >> gradle.properties
+
+          RELEASE_KEY_PASSWORD=$PASS
+          RELEASE_KEY_ALIAS=$ALIAS
+          RELEASE_STORE_PASSWORD=$PASS
+          EOF
+
+          if [ -n "$GSERVICES_B64" ]; then
+            echo "$GSERVICES_B64" | base64 -d > TMessagesProj/google-services.json
+          elif [ ! -f TMessagesProj/google-services.json ]; then
+            cat << 'EOF' > TMessagesProj/google-services.json
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "telegram-armv7",
+              "storage_bucket": "telegram-armv7.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                  "android_client_info": { "package_name": "org.telegram.messenger" }
+                },
+                "api_key": [{ "current_key": "AIzaSyDummyKeyForBuildOnly0000000000000" }]
+              },
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000001",
+                  "android_client_info": { "package_name": "org.telegram.messenger.web" }
+                },
+                "api_key": [{ "current_key": "AIzaSyDummyKeyForBuildOnly0000000000000" }]
+              },
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000002",
+                  "android_client_info": { "package_name": "org.telegram.messenger.beta" }
+                },
+                "api_key": [{ "current_key": "AIzaSyDummyKeyForBuildOnly0000000000000" }]
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          fi
+          cp -f TMessagesProj/google-services.json TMessagesProj_App/google-services.json || true
+
+          if [ -n "$TG_API_ID" ]; then
+            sed -i "s/APP_ID = .*;/APP_ID = ${TG_API_ID};/" \
+              TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          fi
+          if [ -n "$TG_API_HASH" ]; then
+            sed -i "s/APP_HASH = \".*\";/APP_HASH = \"${TG_API_HASH}\";/" \
+              TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
+          fi
 
       - name: Generate ci/optimize.init.gradle
         run: |
@@ -210,16 +278,19 @@ jobs:
           KS_PASS: ${{ secrets.KS_PASS }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
+          PASS="${KS_PASS:-android}"
+          ALIAS="${KEY_ALIAS:-androiddebugkey}"
+
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
-          APK=$(find . -path '*outputs/apk*' -name '*-release*.apk' | head -1)
+          APK=$(find . -path '*outputs/apk*' -name '*.apk' | head -1)
           echo "Found raw APK: $APK"
           
           # -z перепаковує непожаті потоки алгоритмом Zopfli
           $BT/zipalign -f -p -z 4 "$APK" aligned.apk
           
           OUT_APK="telegram-${GITHUB_REF_NAME:-dev}-armv7.apk"
-          $BT/apksigner sign --ks release.keystore --ks-pass env:KS_PASS \
-            --ks-key-alias "$KEY_ALIAS" \
+          $BT/apksigner sign --ks release.keystore --ks-pass "pass:$PASS" \
+            --ks-key-alias "$ALIAS" \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
