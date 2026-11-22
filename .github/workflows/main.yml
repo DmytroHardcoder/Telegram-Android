@@ -1,5 +1,13 @@
 name: Release Telegram (ARMv7 Terminator)
 
+# Зібрано з публічних CI-скриптів збірок Telegram Android:
+#   * coinman-dev/recgram      — sdkmanager для NDK/CMake, .cxx-кеш, перевірка сертифіката + SHA256SUMS,
+#                                prerelase-теги
+#   * eduardobastier/telegram-pro — -Dorg.gradle.jvmargs з CLI, sdkmanager, --console=plain
+#   * aquqa/Telegram            — валідація Base64-keystore + keytool-перевірка ДО 90-хвилинної збірки
+#   * Mercurygram/Mercurygram   — підпис через -PRELEASE_* (без мутації gradle.properties), sdkmanager з retry
+# Логіка Terminator (R8, ThinLTO, armv7-лок, uk-ресурси, ccache) — твоя, збережена.
+
 on:
   push:
     branches: ['master', 'main']
@@ -13,9 +21,12 @@ concurrency:
 env:
   ABI: armeabi-v7a
   FLAVOR: Afat
-  # Ubuntu 24.04 runner ≈ 16 GB RAM. 9 GB під Gradle/R8 + паралельний GC.
-  # ВАЖЛИВО: gradle.properties репозиторію вже містить org.gradle.jvmargs=-Xmx8g,
-  # тому розмір купи задаємо саме там (крок Inject Secrets), а не через env.
+  # Версії беремо з TMessagesProj/build.gradle (ndkVersion 27.2.12479018, buildToolsVersion 36.0.0)
+  NDK_VERSION: 27.2.12479018
+  CMAKE_VERSION: 3.22.1
+  BUILD_TOOLS_VERSION: 36.0.0
+  COMPILE_SDK: 36
+  # 16 GB RAM на ubuntu-24.04: 9 GB Gradle/R8 + паралельний GC
   GRADLE_JVMARGS: '-Xmx9g -XX:MaxMetaspaceSize=1g -XX:+UseParallelGC -Dfile.encoding=UTF-8'
   KOTLIN_DAEMON_JVMARGS: '-Xmx4g'
   GRADLE_OPTS: >-
@@ -32,10 +43,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
+      # ── 1. Звільняємо диск (recgram/telegram-pro) ─────────────────────────────
       - name: Nuke runner bloatware
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
-            /opt/hostedtoolcache/CodeQL /usr/local/lib/android/sdk/ndk/2[0-5].* || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk \
+            /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/share/swift || true
           df -h /
 
       - uses: actions/checkout@v4
@@ -47,6 +60,28 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+
+      # ── 2. SDK-компоненти явно (recgram, telegram-pro, Mercurygram) ───────────
+      # Без цього кроку на чистому ранері часто падає "NDK not configured"
+      # або "compileSdk 36 not found".
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          ok=0
+          for i in 1 2 3; do
+            if "$SDKMANAGER" "platform-tools" "platforms;android-${COMPILE_SDK}" \
+                 "build-tools;${BUILD_TOOLS_VERSION}" "ndk;${NDK_VERSION}" \
+                 "cmake;${CMAKE_VERSION}"; then
+              ok=1; break
+            fi
+            echo "sdkmanager спроба $i не вдалась, ретрай..."
+            sleep $((i * 10))
+          done
+          [ "$ok" = 1 ] || { echo "::error::sdkmanager не зміг встановити компоненти"; exit 1; }
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ls "$ANDROID_HOME/ndk"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -66,6 +101,17 @@ jobs:
           ccache -o sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
           ccache -z
 
+      # ── 3. Кеш конфігурації CMake (recgram) — економить 20-40 хв на реранах ──
+      - name: Cache CMake configure output
+        uses: actions/cache@v4
+        with:
+          path: |
+            TMessagesProj/.cxx
+            TMessagesProj_App/.cxx
+          key: cxx-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ hashFiles('TMessagesProj/jni/**/CMakeLists.txt', '.gitmodules') }}
+          restore-keys: cxx-${{ runner.os }}-${{ env.NDK_VERSION }}-
+
+      # ── 4. Секрети + keystore (aquqa: валідація ДО збірки) ────────────────────
       - name: Inject Secrets (with DrKLO fallbacks)
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
@@ -74,42 +120,42 @@ jobs:
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           KS_PASS: ${{ secrets.KS_PASS }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
         run: |
           set -euo pipefail
+          umask 077
           PASS="${KS_PASS:-android}"
-          ALIAS="${KEY_ALIAS:-androidkey}"   # дефолт мусить збігатися з ключем, який створюємо нижче
+          ALIAS="${KEY_ALIAS:-androidkey}"
+          KPASS="${KEY_PASS:-$PASS}"
 
           if [ -n "$KEYSTORE_B64" ]; then
-            printf '%s' "$KEYSTORE_B64" | base64 -d > release.keystore
-            ALIAS="${KEY_ALIAS:?KEY_ALIAS обов'язковий, якщо використовується власний keystore}"
-            PASS="${KS_PASS:?KS_PASS обов'язковий, якщо використовується власний keystore}"
+            # Base64 може містити переноси рядків — чистимо перед декодуванням (aquqa)
+            printf '%s' "$KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > release.keystore
+            [ -s release.keystore ] || { echo "::error::Декодований keystore порожній"; exit 1; }
+            # Ловимо неправильний пароль/аліас зараз, а не через 90 хвилин
+            keytool -list -keystore release.keystore -storepass "$PASS" -alias "$ALIAS" > /dev/null \
+              || { echo "::error::Keystore не відкривається: перевір KS_PASS / KEY_ALIAS"; exit 1; }
           else
+            echo "::warning::KEYSTORE_B64 не заданий — генерую тимчасовий ключ (APK не оновить застосунок)"
             keytool -genkeypair -v -keystore release.keystore -alias "$ALIAS" \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "$PASS" -keypass "$PASS" \
+              -storepass "$PASS" -keypass "$KPASS" \
               -dname "CN=Telegram, OU=Android, O=Telegram, L=Kyiv, S=Kyiv, C=UA"
           fi
 
           mkdir -p TMessagesProj/config
           cp -f release.keystore TMessagesProj/config/release.keystore
 
-          # Один heredoc — один EOF-маркер. Порожній рядок на початку не потрібен.
-          # Один heredoc — один EOF-маркер; порожній рядок перед ним не потрібен.
-          cat >> gradle.properties <<EOF
-
-          RELEASE_KEY_PASSWORD=$PASS
-          RELEASE_KEY_ALIAS=$ALIAS
-          RELEASE_STORE_PASSWORD=$PASS
-          EOF
-
-          # Купа JVM: у gradle.properties вже є org.gradle.jvmargs=-Xmx8g — переписуємо рядок,
-          # бо дублювання ключа лишає старе значення.
-          sed -i -E "s|^org\.gradle\.jvmargs=.*|org.gradle.jvmargs=${GRADLE_JVMARGS}|" gradle.properties
-          echo "--- gradle.properties (tail) ---"
-          tail -n 8 gradle.properties
+          # Підпис передаємо Gradle через -P (як Mercurygram) — gradle.properties
+          # не чіпаємо, дублікатів ключів немає.
+          {
+            echo "RELEASE_STORE_PASSWORD=$PASS"
+            echo "RELEASE_KEY_ALIAS=$ALIAS"
+            echo "RELEASE_KEY_PASSWORD=$KPASS"
+          } >> "$GITHUB_ENV"
 
           if [ -n "$GSERVICES_B64" ]; then
-            printf '%s' "$GSERVICES_B64" | base64 -d > TMessagesProj/google-services.json
+            printf '%s' "$GSERVICES_B64" | tr -d '\n\r ' | base64 -d > TMessagesProj/google-services.json
           elif [ ! -f TMessagesProj/google-services.json ]; then
             cat <<'EOF' > TMessagesProj/google-services.json
           {
@@ -162,12 +208,13 @@ jobs:
               || { echo "::error::Не вдалося підмінити APP_HASH"; exit 1; }
           fi
 
+      # ── 5. Init-скрипт (усі оптимізації Terminator) ───────────────────────────
       - name: Generate ci/optimize.init.gradle
         run: |
           set -euo pipefail
           mkdir -p ci
           cat << 'EOF' > ci/optimize.init.gradle
-          // ci/optimize.init.gradle — генерується воркфлоу (крок "Generate ci/optimize.init.gradle").
+          // ci/optimize.init.gradle — генерується воркфлоу (крок вище).
           // Підключається через: ./gradlew ... -I ci/optimize.init.gradle
           //
           // ГОЛОВНЕ ПРО ПОРЯДОК ВИКОНАННЯ (саме через це падало
@@ -219,7 +266,6 @@ jobs:
               '-Xno-receiver-assertions'
           ] as List<String>
 
-          // Сміття, яке не має потрапляти в APK
           def APK_EXCLUDES = [
               'META-INF/*.version',
               'META-INF/*.kotlin_module',
@@ -293,8 +339,6 @@ jobs:
                   }
 
                   // ── 4. Жорсткий лок на 32-бітний armv7 (defaultConfig + flavors + buildTypes) ──
-                  // Флейвори вже створені (build.gradle відпрацював), тому clear() реально
-                  // знімає оголошені там "armeabi-v7a", "arm64-v8a", "x86", "x86_64".
                   // Працює і зі старим MutableSet<String>, і з новим SetProperty<String>.
                   def lockAbi = { cfg ->
                       try {
@@ -416,48 +460,75 @@ jobs:
           EOF
           wc -l ci/optimize.init.gradle
 
+      # ── 6. Збірка ─────────────────────────────────────────────────────────────
+      # Підпис — через -PRELEASE_* (Mercurygram): gradle.properties не мутуємо.
+      # --no-configuration-cache: init-скрипт править DSL, кеш конфігурації тут шкідливий.
       - name: Compile (Maximum Overdrive)
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
           CMAKE_BUILD_PARALLEL_LEVEL: 4
         run: |
+          set -o pipefail
           ./gradlew :TMessagesProj_App:assemble${FLAVOR}Release \
             -I ci/optimize.init.gradle \
             -Pandroid.injected.build.abi=$ABI \
+            -PRELEASE_STORE_PASSWORD="$RELEASE_STORE_PASSWORD" \
+            -PRELEASE_KEY_ALIAS="$RELEASE_KEY_ALIAS" \
+            -PRELEASE_KEY_PASSWORD="$RELEASE_KEY_PASSWORD" \
             -Dkotlin.daemon.jvmargs="$KOTLIN_DAEMON_JVMARGS" \
-            --parallel --build-cache --no-daemon --stacktrace \
+            -Dorg.gradle.jvmargs="$GRADLE_JVMARGS" \
+            --parallel --build-cache --no-daemon --no-configuration-cache \
+            --console=plain --stacktrace \
             -x lint -x lintVitalRelease -x lintVitalAnalyzeRelease \
-            -x test -x testReleaseUnitTest
+            -x test -x testReleaseUnitTest 2>&1 | tee gradle-build.log
           ccache -s
 
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-build-log
+          path: gradle-build.log
+          retention-days: 3
+
+      # ── 7. Перевірка + підпис (recgram: сертифікат + SHA256SUMS) ──────────────
       - name: Align & Sign (v1+v2+v3)
         env:
-          KS_PASS: ${{ secrets.KS_PASS }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          EXPECTED_CERT: ${{ secrets.EXPECTED_CERT_SHA256 }}
         run: |
           set -euo pipefail
-          PASS="${KS_PASS:-android}"
-          ALIAS="${KEY_ALIAS:-androidkey}"
           ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          BT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION"
+          [ -x "$BT/apksigner" ] || BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
 
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
-          echo "build-tools: $BT"
-
-          # Флейвор Afat + buildType Release → підпис APK виконує signingConfig.release
-          # (gradle.properties уже містить RELEASE_STORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD).
-          APK=$(find . -type f -path '*outputs/apk*/*afat*/*release*' -name '*.apk' | head -1)
-          [ -n "$APK" ] || APK=$(find . -type f -path '*outputs/apk*' -name '*.apk' ! -name '*unsigned*' | head -1)
-          [ -n "$APK" ] || { echo "::error::APK не знайдено"; exit 1; }
-          echo "Found APK: $APK"
+          # DrKLO перейменовує вихід у app.apk (applicationVariants.all → outputFileName),
+          # тому шукаємо за конкретними шляхами, а не глобом по всьому дереву.
+          APK=""
+          for cand in \
+              "TMessagesProj_App/build/outputs/apk/afat/release/app.apk" \
+              "TMessagesProj_App/build/outputs/apk/afat/release/afat-release.apk" \
+              "TMessagesProj_App/build/intermediates/apk/afat/release/app.apk"; do
+            if [ -f "$cand" ]; then
+              APK="$cand"
+              break
+            fi
+          done
+          if [ -z "$APK" ]; then
+            APK=$(find . -type f -path '*outputs/apk*' -name '*.apk' ! -name '*unsigned*' | head -1 || true)
+          fi
+          [ -n "$APK" ] && [ -f "$APK" ] || { echo "::error::APK не знайдено"; exit 1; }
+          echo "Found APK: $APK ($(du -h "$APK" | cut -f1))"
 
           # zipalign -p лише вирівнює .so на 4K-сторінку для uncompressed native libs;
           # -z (Zopfli) з AGP-підписаним APK ламає v2/v3-підпис — тому НЕ використовуємо.
           "$BT/zipalign" -f -p 4 "$APK" aligned.apk
 
           OUT_APK="telegram-${GITHUB_REF_NAME:-dev}-armv7.apk"
-          "$BT/apksigner" sign --ks release.keystore --ks-pass "pass:$PASS" \
-            --ks-key-alias "$ALIAS" --key-pass "pass:$PASS" \
+          "$BT/apksigner" sign --ks release.keystore \
+            --ks-pass "pass:$RELEASE_STORE_PASSWORD" \
+            --ks-key-alias "$RELEASE_KEY_ALIAS" \
+            --key-pass "pass:$RELEASE_KEY_PASSWORD" \
             --v1-signing-enabled true \
             --v2-signing-enabled true \
             --v3-signing-enabled true \
@@ -466,18 +537,35 @@ jobs:
 
           rm -f release.keystore aligned.apk
           "$BT/apksigner" verify -v "$OUT_APK" | grep -E "Verified|v[1-3]" || true
+
+          CERT=$("$BT/apksigner" verify --print-certs "$OUT_APK" \
+            | sed -n 's/.*certificate SHA-256 digest: //p' | head -1 | tr 'a-f' 'A-F')
+          echo "cert SHA-256: $CERT"
+          if [ -n "$EXPECTED_CERT" ] && [ "$CERT" != "$EXPECTED_CERT" ]; then
+            echo "::error::APK підписано не тим ключем (очікували $EXPECTED_CERT)"
+            exit 1
+          fi
+
+          sha256sum "$OUT_APK" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
           ls -lh "$OUT_APK"
           echo "OUT_APK=$OUT_APK" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v4
         with:
           name: telegram-armv7
-          path: telegram-*-armv7.apk
+          path: |
+            telegram-*-armv7.apk
+            SHA256SUMS.txt
           compression-level: 0
           retention-days: 3
 
+      # ── 8. Реліз (recgram: пререліз для тегів з суфіксом) ─────────────────────
       - name: Publish Release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "$OUT_APK" --generate-notes
+        run: |
+          PRE=""
+          case "$GITHUB_REF_NAME" in *-*) PRE="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" "$OUT_APK" SHA256SUMS.txt $PRE --generate-notes
