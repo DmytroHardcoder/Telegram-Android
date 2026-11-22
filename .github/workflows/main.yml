@@ -167,19 +167,20 @@ jobs:
           set -euo pipefail
           mkdir -p ci
           cat << 'EOF' > ci/optimize.init.gradle
-          // ci/optimize.init.gradle — ГЕНЕРУЄТЬСЯ цим воркфлоу (крок вище).
+          // ci/optimize.init.gradle — генерується воркфлоу (крок "Generate ci/optimize.init.gradle").
           // Підключається через: ./gradlew ... -I ci/optimize.init.gradle
           //
-          // Init-скрипт оцінюється ДО build-скриптів, тому:
-          //   * android { } ще не існує на момент виконання top-level коду → працюємо через
-          //     plugins.withId(...) + extensions.findByName('android')
-          //   * productFlavors / buildTypes / proguardFiles / packaging з'являються пізніше →
-          //     змінюємо їх у afterEvaluate (саме там build.gradle модуля вже застосований,
-          //     але конфігурація варіантів ще не «заморожена»)
-          //   * після білд-скрипта модуля DSL-блок android.packagingOptions { } перезаписується,
-          //     тому звертаємось до android.packaging напряму (AGP 8.x)
+          // ГОЛОВНЕ ПРО ПОРЯДОК ВИКОНАННЯ (саме через це падало
+          // "It is too late to set isDebuggable"):
+          //   init-скрипт виконується ДО build.gradle модуля, тому звичайний
+          //   proj.afterEvaluate {} реєструється ПІСЛЯ внутрішнього afterEvaluate AGP
+          //   (AGP реєструє його всередині apply()). В результаті варіанти вже створені,
+          //   DSL «заморожений» і будь-який запис у buildTypes валить конфігурацію.
+          //   Рішення: реєструємо afterEvaluate через gradle.beforeProject {} — він стає
+          //   ПЕРШИМ у черзі: відпрацьовує після всього build.gradle модуля, але ДО того,
+          //   як AGP створить варіанти. Там DSL ще вільно змінюється.
 
-          def TERMINATOR_FLAGS_LIST = [
+          def NDK_FLAGS_LIST = [
               '-O3',
               '-mthumb',
               '-march=armv7-a',
@@ -198,9 +199,9 @@ jobs:
               '-g0'
           ] as List<String>
 
-          def TERMINATOR_FLAGS = TERMINATOR_FLAGS_LIST.join(' ')
+          def NDK_FLAGS = NDK_FLAGS_LIST.join(' ')
 
-          def TERMINATOR_LINKER = [
+          def NDK_LINKER = [
               '-fuse-ld=lld',
               '-flto=thin',
               '-Wl,-O3',
@@ -218,7 +219,8 @@ jobs:
               '-Xno-receiver-assertions'
           ] as List<String>
 
-          def KEEP_IN_APK = [
+          // Сміття, яке не має потрапляти в APK
+          def APK_EXCLUDES = [
               'META-INF/*.version',
               'META-INF/*.kotlin_module',
               'META-INF/DEPENDENCIES',
@@ -247,148 +249,172 @@ jobs:
                           try {
                               t.kotlinOptions.freeCompilerArgs += KOTLIN_NO_ASSERTIONS
                           } catch (ignored2) {
-                              // старі/нові API — просто пропускаємо
+                              // інший API — не критично
                           }
                       }
                   }
               }
           }
 
-          // ── 2. Android-модулі (application + library) ───────────────────────────────
-          allprojects { proj ->
-              proj.plugins.withId('com.android.application') {
-                  configureAndroid(proj, true, TERMINATOR_FLAGS_LIST, TERMINATOR_FLAGS, TERMINATOR_LINKER, KEEP_IN_APK)
-              }
-              proj.plugins.withId('com.android.library') {
-                  configureAndroid(proj, false, TERMINATOR_FLAGS_LIST, TERMINATOR_FLAGS, TERMINATOR_LINKER, KEEP_IN_APK)
-              }
-          }
-
-          def configureAndroid(Project proj, boolean isApp, List<String> flagsList,
-                               String flags, String linker, List<String> keepInApk) {
-              def android = proj.extensions.findByName('android')
-              if (android == null) {
-                  return
-              }
-
+          // ── 2. Android-модулі: конфіг ДО створення варіантів AGP ─────────────────────
+          gradle.beforeProject { proj ->
               proj.afterEvaluate {
-                  // Фікс сумісності кастомних buildTypes із бібліотеками (:jlatexmath тощо).
-                  // buildTypes.all {} безпечний: нові типи створюються через create(), лямбда викликається одразу.
-                  android.buildTypes.all { bt ->
-                      if (bt.name != 'debug' && bt.name != 'release') {
-                          try {
-                              if (bt.matchingFallbacks.isEmpty()) {
-                                  bt.matchingFallbacks = ['release']
-                              }
-                          } catch (ignored) {}
-                      }
+                  def android = proj.extensions.findByName('android')
+                  if (android == null) {
+                      return
                   }
 
-                  // ── 3. ТІЛЬКИ дефолтні ресурси з values/ + українська ('uk'). Ніяких 'en'. ──
+                  def isApp = proj.plugins.hasPlugin('com.android.application')
+                  def log = { String msg -> proj.logger.lifecycle("[optimize] ${proj.path}: ${msg}") }
+
+                  // Фікс сумісності кастомних buildTypes із бібліотеками (:jlatexmath тощо)
+                  try {
+                      android.buildTypes.all { bt ->
+                          if (bt.name != 'debug' && bt.name != 'release' && bt.matchingFallbacks.isEmpty()) {
+                              bt.matchingFallbacks = ['release']
+                          }
+                      }
+                  } catch (e) {
+                      log("matchingFallbacks skip: ${e.message}")
+                  }
+
+                  // ── 3. ТІЛЬКИ дефолтні ресурси з values/ + українська ('uk'). Ніяких 'en' ──
                   if (isApp) {
                       try {
                           android.defaultConfig.resourceConfigurations.clear()
                           android.defaultConfig.resourceConfigurations.add('uk')
-                      } catch (ignored) {
-                          try { android.defaultConfig.resConfigs('uk') } catch (ignored2) {}
+                      } catch (e) {
+                          try {
+                              android.defaultConfig.resConfigs('uk')
+                          } catch (e2) {
+                              log("resourceConfigurations skip: ${e2.message}")
+                          }
                       }
                   }
 
                   // ── 4. Жорсткий лок на 32-бітний armv7 (defaultConfig + flavors + buildTypes) ──
+                  // Флейвори вже створені (build.gradle відпрацював), тому clear() реально
+                  // знімає оголошені там "armeabi-v7a", "arm64-v8a", "x86", "x86_64".
+                  // Працює і зі старим MutableSet<String>, і з новим SetProperty<String>.
                   def lockAbi = { cfg ->
                       try {
-                          cfg.ndk.abiFilters.clear()
-                          cfg.ndk.abiFilters.add('armeabi-v7a')
-                      } catch (ignored) {}
+                          def filters = cfg.ndk.abiFilters
+                          if (filters == null) {
+                              return
+                          }
+                          try {
+                              filters.clear()
+                              filters.add('armeabi-v7a')
+                          } catch (e1) {
+                              try {
+                                  filters.set(['armeabi-v7a'])
+                              } catch (e2) {
+                                  log("abiFilters skip: ${e2.message}")
+                              }
+                          }
+                      } catch (e) {
+                          log("abiFilters skip: ${e.message}")
+                      }
                   }
                   lockAbi(android.defaultConfig)
-                  android.productFlavors.all { flavor -> lockAbi(flavor) }
-                  android.buildTypes.all { bt -> lockAbi(bt) }
+                  try { android.productFlavors.all { flavor -> lockAbi(flavor) } } catch (ignored) {}
+                  try { android.buildTypes.all { bt -> lockAbi(bt) } } catch (ignored) {}
 
                   try {
                       android.splits.abi.enable = false
                       android.splits.density.enable = false
-                  } catch (ignored) {}
+                  } catch (ignored) {
+                      // у library-модулів splits немає — це нормально
+                  }
 
-                  // ── 5. R8 / ProGuard на максималках ──
-                  // shrinkResources дозволений ТІЛЬКИ для com.android.application —
-                  // інакше падає збірка бібліотек (:TMessagesProj, :jlatexmath).
-                  android.buildTypes.matching { it.name == 'release' }.all { bt ->
-                      bt.debuggable = false
-                      bt.jniDebuggable = false
-                      try { bt.renderscriptDebuggable = false } catch (ignored) {}
-                      try { bt.pseudoLocalesEnabled = false } catch (ignored) {}
-                      try { bt.ndk.debugSymbolLevel = 'NONE' } catch (ignored) {}
-
-                      if (isApp) {
-                          bt.minifyEnabled = true
-                          bt.shrinkResources = true
-                          try { bt.crunchPngs = true } catch (ignored) {}
-
-                          // proguard-rules.pro модуля лишаємо, додаємо лише optimize-варіант
-                          // (AGP 8 сам додає proguard-android.txt — його прибираємо, якщо раптом є).
+                  // ── 5. R8 / ProGuard ──
+                  // DrKLO уже тримає для release: debuggable=false, jniDebuggable=false,
+                  // minifyEnabled=true, shrinkResources=true і proguard-android-optimize.txt.
+                  // Тому тут НЕ переписуємо ці властивості (саме вони й падали з
+                  // "too late to set isDebuggable") — лише добиваємо те, чого немає,
+                  // і прибираємо дебаг-символи з нативки.
+                  try {
+                      android.buildTypes.all { bt ->
                           try {
-                              def files = (bt.proguardFiles ?: []).findAll { !it.name.contains('proguard-android.txt') }
-                              def optimize = android.getDefaultProguardFile('proguard-android-optimize.txt')
-                              if (!files.any { it.name == optimize.name }) {
-                                  files << optimize
+                              if (bt.ndk.debugSymbolLevel != 'NONE') {
+                                  bt.ndk.debugSymbolLevel = 'NONE'
                               }
-                              bt.setProguardFiles(files as File[])
                           } catch (ignored) {}
+                          if (bt.name == 'release' && isApp) {
+                              try { if (!bt.minifyEnabled) bt.minifyEnabled = true } catch (ignored) {}
+                              try { if (!bt.shrinkResources) bt.shrinkResources = true } catch (ignored) {}
+                          }
                       }
+                  } catch (e) {
+                      log("buildTypes skip: ${e.message}")
                   }
 
                   // ── 6. Випалюємо сміття з APK ──
-                  // jniLibs.useLegacyPackaging=true стискає .so всередині APK (~2× менший APK).
+                  // jniLibs.useLegacyPackaging=true стискає .so всередині APK (менший APK).
+                  // Звертаємось до android.packaging, а не packagingOptions { }: DSL-блок
+                  // перезаписується build.gradle модуля.
+                  // Кожна властивість — окремо: якщо AGP змінить тип, не втрачаємо решту.
                   try {
-                      def packaging = android.packaging
-                      packaging.jniLibs.useLegacyPackaging.set(true)
-                      packaging.resources.excludes.addAll(keepInApk)
-                  } catch (ignored) {
-                      proj.logger.lifecycle("[optimize] packaging skip for ${proj.path}: ${ignored.message}")
+                      def legacy = android.packaging.jniLibs.useLegacyPackaging
+                      try {
+                          legacy.set(true)
+                      } catch (e) {
+                          legacy = true
+                      }
+                  } catch (e) {
+                      log("jniLibs.useLegacyPackaging skip: ${e.message}")
+                  }
+                  try {
+                      android.packaging.resources.excludes.addAll(APK_EXCLUDES)
+                  } catch (e) {
+                      log("resources.excludes skip: ${e.message}")
                   }
 
                   // ── 7. Нативна м'ясорубка (Clang + LLD + ThinLTO + NEON + Thumb-2) ──
-                  // Прапорці для CMake живуть у defaultConfig.externalNativeBuild.cmake
-                  // (саме так їх читає AGP), а path — у android.externalNativeBuild.cmake.
-                  def nativePresent = false
+                  // Прапорці живуть у defaultConfig.externalNativeBuild.cmake — саме звідти
+                  // їх читає AGP при створенні варіантів.
+                  def hasNative = false
                   try {
                       def topCmake = android.externalNativeBuild?.cmake
                       if (topCmake != null) {
+                          def raw = null
                           try {
-                              nativePresent = topCmake.path.orNull != null
-                          } catch (ignored) {
-                              nativePresent = topCmake.path != null
+                              raw = topCmake.path
+                          } catch (ignored) {}
+                          if (raw != null) {
+                              try {
+                                  // Property<File> (AGP 8)
+                                  raw = raw.getOrNull()
+                              } catch (ignored) {
+                                  // простий File — лишаємо як є
+                              }
+                              hasNative = raw != null
                           }
                       }
                   } catch (ignored) {}
 
-                  if (!nativePresent) {
-                      return
-                  }
-
-                  try {
-                      def cmake = android.defaultConfig.externalNativeBuild.cmake
-                      cmake.cFlags.addAll(flagsList)
-                      cmake.cppFlags.addAll(flagsList)
-                      cmake.arguments.addAll([
-                          '-DANDROID_STL=c++_static',
-                          '-DANDROID_ARM_NEON=TRUE',
-                          '-DCMAKE_BUILD_TYPE=Release',
-                          "-DCMAKE_C_FLAGS_RELEASE=${flags}",
-                          "-DCMAKE_CXX_FLAGS_RELEASE=${flags}",
-                          "-DCMAKE_SHARED_LINKER_FLAGS=${linker}",
-                          "-DCMAKE_MODULE_LINKER_FLAGS=${linker}"
-                      ])
-                  } catch (ignored) {
-                      proj.logger.lifecycle("[optimize] cmake flags skip for ${proj.path}: ${ignored.message}")
+                  if (hasNative) {
+                      try {
+                          def cmake = android.defaultConfig.externalNativeBuild.cmake
+                          cmake.cFlags.addAll(NDK_FLAGS_LIST)
+                          cmake.cppFlags.addAll(NDK_FLAGS_LIST)
+                          cmake.arguments.addAll([
+                              '-DANDROID_STL=c++_static',
+                              '-DANDROID_ARM_NEON=TRUE',
+                              '-DCMAKE_BUILD_TYPE=Release',
+                              "-DCMAKE_C_FLAGS_RELEASE=${NDK_FLAGS}",
+                              "-DCMAKE_CXX_FLAGS_RELEASE=${NDK_FLAGS}",
+                              "-DCMAKE_SHARED_LINKER_FLAGS=${NDK_LINKER}",
+                              "-DCMAKE_MODULE_LINKER_FLAGS=${NDK_LINKER}"
+                          ])
+                      } catch (e) {
+                          log("cmake flags skip: ${e.message}")
+                      }
                   }
               }
           }
           EOF
-          # синтаксичний «самозахист»: файл не порожній і має очікуваний хвіст
           wc -l ci/optimize.init.gradle
-          tail -n 3 ci/optimize.init.gradle
 
       - name: Compile (Maximum Overdrive)
         env:
@@ -400,7 +426,7 @@ jobs:
             -I ci/optimize.init.gradle \
             -Pandroid.injected.build.abi=$ABI \
             -Dkotlin.daemon.jvmargs="$KOTLIN_DAEMON_JVMARGS" \
-            --parallel --build-cache --no-daemon \
+            --parallel --build-cache --no-daemon --stacktrace \
             -x lint -x lintVitalRelease -x lintVitalAnalyzeRelease \
             -x test -x testReleaseUnitTest
           ccache -s
