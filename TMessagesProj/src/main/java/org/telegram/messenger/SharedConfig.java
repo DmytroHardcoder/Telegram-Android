@@ -637,7 +637,7 @@ public class SharedConfig {
             suggestStickers = preferences.getInt("suggestStickers", 0);
             suggestAnimatedEmoji = preferences.getBoolean("suggestAnimatedEmoji", true);
             overrideDevicePerformanceClass = preferences.getInt("overrideDevicePerformanceClass", -1);
-            devicePerformanceClass = preferences.getInt("devicePerformanceClass", -1);
+            devicePerformanceClass = preferences.getInt("devicePerformanceClass", 0);
             sortContactsByName = preferences.getBoolean("sortContactsByName", false);
             sortFilesByName = preferences.getBoolean("sortFilesByName", false);
             noSoundHintShowed = preferences.getBoolean("noSoundHintShowed", false);
