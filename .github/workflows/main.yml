@@ -12,7 +12,7 @@ concurrency:
 
 env:
   ABI: armeabi-v7a
-  FLAVOR: Standalone
+  FLAVOR: Armv7
   # На ubuntu-24.04 є 16GB RAM. Віддаємо 9GB під Gradle/R8, вмикаємо паралельний GC
   GRADLE_OPTS: >-
     -Dorg.gradle.daemon=false
@@ -149,12 +149,20 @@ jobs:
                   // 1. Вирізаємо рантайм-перевірки Kotlin з байткоду (менший DEX, швидший запуск)
                   p.tasks.matching { it.class.name.contains("KotlinCompile") }.configureEach {
                       try {
-                          kotlinOptions.freeCompilerArgs += [
+                          compilerOptions.freeCompilerArgs.addAll([
                               '-Xno-param-assertions',
                               '-Xno-call-assertions',
                               '-Xno-receiver-assertions'
-                          ]
-                      } catch (ignored) {}
+                          ])
+                      } catch (ignored) {
+                          try {
+                              kotlinOptions.freeCompilerArgs += [
+                                  '-Xno-param-assertions',
+                                  '-Xno-call-assertions',
+                                  '-Xno-receiver-assertions'
+                              ]
+                          } catch (ignored2) {}
+                      }
                   }
 
                   def android = p.extensions.findByName('android')
@@ -162,20 +170,26 @@ jobs:
 
                   def isApp = p.plugins.hasPlugin('com.android.application')
 
+                  // Фікс сумісності кастомних buildTypes (standalone, HA_*) з бібліотеками типу :jlatexmath
+                  android.buildTypes.all { bt ->
+                      if (bt.name != 'debug' && bt.name != 'release') {
+                          try { bt.matchingFallbacks += ['release'] } catch (ignored) {}
+                      }
+                  }
+
                   // 2. ТІЛЬКИ дефолтний конфіг (вшитий у values/) та Українська ('uk'). Ніяких 'en'!
                   if (isApp) {
-                      android.defaultConfig.resConfigs("uk")
+                      try {
+                          android.defaultConfig.resourceConfigurations.clear()
+                          android.defaultConfig.resourceConfigurations.add("uk")
+                      } catch (ignored) {
+                          android.defaultConfig.resConfigs("uk")
+                      }
                   }
 
                   // 3. Жорсткий лок на 32-бітний armv7
                   android.defaultConfig.ndk.abiFilters.clear()
                   android.defaultConfig.ndk.abiFilters.add('armeabi-v7a')
-                  android.productFlavors.all { flavor ->
-                      try {
-                          flavor.ndk.abiFilters.clear()
-                          flavor.ndk.abiFilters.add('armeabi-v7a')
-                      } catch (ignored) {}
-                  }
                   if (android.hasProperty('splits')) {
                       android.splits.abi.enable = false
                       android.splits.density.enable = false
@@ -205,7 +219,7 @@ jobs:
                   }
 
                   // 5. R8 / ProGuard на максималках (shrinkResources дозволений тільки для com.android.application)
-                  android.buildTypes.matching { it.name == 'release' || it.name == 'standalone' || it.name == 'HA_public' }.all { bt ->
+                  android.buildTypes.matching { it.name == 'release' || it.name == 'standalone' }.all { bt ->
                       bt.debuggable = false
                       bt.jniDebuggable = false
                       bt.renderscriptDebuggable = false
@@ -225,7 +239,7 @@ jobs:
                   }
 
                   // 6. Нативна м'ясорубка (Clang + LLD + ThinLTO + ARMv7 NEON + Thumb-2)
-                  def terminatorFlagsList = [
+                  def terminatorFlags = [
                       '-O3',
                       '-mthumb',                        // Компактний 16/32-bit Thumb-2 код без втрати швидкості
                       '-march=armv7-a',
@@ -242,8 +256,7 @@ jobs:
                       '-fno-asynchronous-unwind-tables',
                       '-DNDEBUG',
                       '-g0'                             // Нуль дебаг-інфи на рівні компілятора
-                  ]
-                  def terminatorFlags = terminatorFlagsList.join(' ')
+                  ].join(' ')
 
                   def terminatorLinker = [
                       '-fuse-ld=lld',
@@ -259,35 +272,15 @@ jobs:
 
                   if (android.externalNativeBuild?.cmake?.path != null) {
                       android.defaultConfig.externalNativeBuild.cmake.with {
-                          cFlags.addAll(terminatorFlagsList)
-                          cppFlags.addAll(terminatorFlagsList)
-                          arguments.addAll([
-                              '-DANDROID_STL=c++_static',
-                              '-DANDROID_ARM_NEON=TRUE',
-                              '-DCMAKE_BUILD_TYPE=Release',
-                              "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
-                              "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
-                              "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
-                              "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
-                          ])
-                      }
-                  }
-
-                  // 7. Авто-аліас таски збірки, якщо флейвор називається armv7/afat замість Standalone
-                  if (isApp) {
-                      p.tasks.addRule("Pattern: assemble<Flavor>Release") { String taskName ->
-                          if (taskName == "assembleStandaloneRelease" || taskName == "assembleArmv7Release") {
-                              p.tasks.register(taskName) { t ->
-                                  def candidates = p.tasks.matching {
-                                      it.name.startsWith("assemble") &&
-                                      it.name != taskName &&
-                                      !it.name.contains("Test") &&
-                                      (it.name.toLowerCase().contains("armv7") || it.name.toLowerCase().contains("standalone") || it.name.toLowerCase().contains("afat") || it.name == "assembleRelease") &&
-                                      (it.name.toLowerCase().contains("release") || it.name.toLowerCase().contains("standalone"))
-                                  }
-                                  t.dependsOn(candidates)
-                              }
-                          }
+                          cFlags += " ${terminatorFlags}"
+                          cppFlags += " ${terminatorFlags}"
+                          arguments '-DANDROID_STL=c++_static',
+                                    '-DANDROID_ARM_NEON=TRUE',
+                                    '-DCMAKE_BUILD_TYPE=Release',
+                                    "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
+                                    "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
+                                    "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
+                                    "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
                       }
                   }
               }
