@@ -73,6 +73,124 @@ jobs:
           sed -i "s/APP_HASH = \".*\";/APP_HASH = \"${{ secrets.TG_API_HASH }}\";/" \
             TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java
 
+      - name: Generate ci/optimize.init.gradle
+        run: |
+          mkdir -p ci
+          cat << 'EOF' > ci/optimize.init.gradle
+          allprojects {
+              afterEvaluate { p ->
+                  // 1. Вирізаємо рантайм-перевірки Kotlin з байткоду (менший DEX, швидший запуск)
+                  p.tasks.matching { it.class.name.contains("KotlinCompile") }.configureEach {
+                      try {
+                          kotlinOptions.freeCompilerArgs += [
+                              '-Xno-param-assertions',
+                              '-Xno-call-assertions',
+                              '-Xno-receiver-assertions'
+                          ]
+                      } catch (ignored) {}
+                  }
+
+                  def android = p.extensions.findByName('android')
+                  if (android == null) return
+
+                  // 2. ТІЛЬКИ дефолтний конфіг (вшитий у values/) та Українська ('uk'). Ніяких 'en'!
+                  android.defaultConfig.resConfigs("uk")
+
+                  // 3. Жорсткий лок на 32-бітний armv7
+                  android.defaultConfig.ndk.abiFilters.clear()
+                  android.defaultConfig.ndk.abiFilters.add('armeabi-v7a')
+                  if (android.hasProperty('splits')) {
+                      android.splits.abi.enable = false
+                      android.splits.density.enable = false
+                  }
+
+                  // 4. Випалюємо сміття з APK
+                  android.packagingOptions {
+                      jniLibs.useLegacyPackaging = true // Стискати .so всередині APK (ріже розмір APK вдвічі)
+                      resources.excludes += [
+                          'META-INF/*.version',
+                          'META-INF/*.kotlin_module',
+                          'META-INF/DEPENDENCIES',
+                          'META-INF/LICENSE*',
+                          'META-INF/NOTICE*',
+                          'META-INF/AL2.0',
+                          'META-INF/LGPL2.1',
+                          'META-INF/proguard/**',
+                          'META-INF/com.android.tools/**',
+                          'META-INF/services/**',
+                          'kotlin/**',
+                          'DebugProbesKt.bin',
+                          '**/*.kotlin_builtins',
+                          '**/*.proto',
+                          'google/protobuf/**',
+                          'okhttp3/internal/publicsuffix/*'
+                      ]
+                  }
+
+                  // 5. R8 / ProGuard на максималках
+                  android.buildTypes.matching { it.name == 'release' }.all { bt ->
+                      bt.minifyEnabled = true
+                      bt.shrinkResources = true
+                      bt.crunchPngs = true
+                      bt.debuggable = false
+                      bt.jniDebuggable = false
+                      bt.renderscriptDebuggable = false
+                      bt.pseudoLocalesEnabled = false
+                      bt.ndk.debugSymbolLevel = 'NONE'
+
+                      // Підміняємо дефолтний proguard-android.txt на агресивний optimize
+                      def currentFiles = bt.proguardFiles.findAll { !it.name.contains('proguard-android.txt') }
+                      bt.setProguardFiles(currentFiles)
+                      bt.proguardFile(android.getDefaultProguardFile('proguard-android-optimize.txt'))
+                  }
+
+                  // 6. Нативна м'ясорубка (Clang + LLD + ThinLTO + ARMv7 NEON + Thumb-2)
+                  def terminatorFlags = [
+                      '-O3',
+                      '-mthumb',                        // Компактний 16/32-bit Thumb-2 код без втрати швидкості
+                      '-march=armv7-a',
+                      '-mfpu=neon',                     // Примусовий SIMD для відео/аудіо/стікерів
+                      '-mfloat-abi=softfp',
+                      '-flto=thin',                     // Міжмодульна оптимізація
+                      '-fomit-frame-pointer',           // Звільняємо регістр R7/R11 для обчислень
+                      '-ffunction-sections',
+                      '-fdata-sections',
+                      '-fvisibility=hidden',
+                      '-fvisibility-inlines-hidden',
+                      '-fmerge-all-constants',          // Зливає однакові константи в пам'яті
+                      '-fno-unwind-tables',             // Викидає таблиці розмотки стеку (економія МБ)
+                      '-fno-asynchronous-unwind-tables',
+                      '-DNDEBUG',
+                      '-g0'                             // Нуль дебаг-інфи на рівні компілятора
+                  ].join(' ')
+
+                  def terminatorLinker = [
+                      '-fuse-ld=lld',
+                      '-flto=thin',
+                      '-Wl,-O3',
+                      '-Wl,--gc-sections',              // Видаляє невикористані функції
+                      '-Wl,--icf=all',                  // Склеює функції з однаковим машинним кодом
+                      '-Wl,--strip-all',                // Повний стрип символів
+                      '-Wl,--exclude-libs,ALL',         // КРИТИЧНО: ховає символи статичних ліб (ffmpeg/ssl), дозволяючи їх вирізати
+                      '-Wl,-Bsymbolic',                 // Прискорює виклики функцій всередині .so
+                      '-Wl,--build-id=none'             // Прибирає хеш білда з заголовка ELF
+                  ].join(' ')
+
+                  android.defaultConfig.externalNativeBuild.cmake.with {
+                      cFlags += " ${terminatorFlags}"
+                      cppFlags += " ${terminatorFlags}"
+                      arguments '-DANDROID_STL=c++_static',
+                                '-DANDROID_ARM_NEON=TRUE',
+                                '-DCMAKE_BUILD_TYPE=Release',
+                                "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
+                                "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
+                                "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
+                                "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
+                  }
+              }
+          }
+          EOF
+
       - name: Compile (Maximum Overdrive)
         env:
           CMAKE_C_COMPILER_LAUNCHER: ccache
