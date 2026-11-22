@@ -12,7 +12,7 @@ concurrency:
 
 env:
   ABI: armeabi-v7a
-  FLAVOR: Armv7
+  FLAVOR: Afat
   # На ubuntu-24.04 є 16GB RAM. Віддаємо 9GB під Gradle/R8, вмикаємо паралельний GC
   GRADLE_OPTS: >-
     -Dorg.gradle.daemon=false
@@ -170,7 +170,7 @@ jobs:
 
                   def isApp = p.plugins.hasPlugin('com.android.application')
 
-                  // Фікс сумісності кастомних buildTypes (standalone, HA_*) з бібліотеками типу :jlatexmath
+                  // Фікс сумісності кастомних buildTypes із бібліотеками (:jlatexmath тощо)
                   android.buildTypes.all { bt ->
                       if (bt.name != 'debug' && bt.name != 'release') {
                           try { bt.matchingFallbacks += ['release'] } catch (ignored) {}
@@ -187,9 +187,27 @@ jobs:
                       }
                   }
 
-                  // 3. Жорсткий лок на 32-бітний armv7
+                  // 3. Жорсткий лок на 32-бітний armv7 (у defaultConfig, всіх flavors включно з afat, та buildTypes)
                   android.defaultConfig.ndk.abiFilters.clear()
                   android.defaultConfig.ndk.abiFilters.add('armeabi-v7a')
+                  try { android.defaultConfig.externalNativeBuild.cmake.abiFilters.clear() } catch (ignored) {}
+
+                  android.productFlavors.all { flavor ->
+                      try {
+                          flavor.ndk.abiFilters.clear()
+                          flavor.ndk.abiFilters.add('armeabi-v7a')
+                      } catch (ignored) {}
+                      try { flavor.externalNativeBuild.cmake.abiFilters.clear() } catch (ignored) {}
+                  }
+
+                  android.buildTypes.all { bt ->
+                      try {
+                          bt.ndk.abiFilters.clear()
+                          bt.ndk.abiFilters.add('armeabi-v7a')
+                      } catch (ignored) {}
+                      try { bt.externalNativeBuild.cmake.abiFilters.clear() } catch (ignored) {}
+                  }
+
                   if (android.hasProperty('splits')) {
                       android.splits.abi.enable = false
                       android.splits.density.enable = false
@@ -219,7 +237,7 @@ jobs:
                   }
 
                   // 5. R8 / ProGuard на максималках (shrinkResources дозволений тільки для com.android.application)
-                  android.buildTypes.matching { it.name == 'release' || it.name == 'standalone' }.all { bt ->
+                  android.buildTypes.matching { it.name == 'release' }.all { bt ->
                       bt.debuggable = false
                       bt.jniDebuggable = false
                       bt.renderscriptDebuggable = false
@@ -239,7 +257,7 @@ jobs:
                   }
 
                   // 6. Нативна м'ясорубка (Clang + LLD + ThinLTO + ARMv7 NEON + Thumb-2)
-                  def terminatorFlags = [
+                  def terminatorFlagsList = [
                       '-O3',
                       '-mthumb',                        // Компактний 16/32-bit Thumb-2 код без втрати швидкості
                       '-march=armv7-a',
@@ -256,7 +274,8 @@ jobs:
                       '-fno-asynchronous-unwind-tables',
                       '-DNDEBUG',
                       '-g0'                             // Нуль дебаг-інфи на рівні компілятора
-                  ].join(' ')
+                  ]
+                  def terminatorFlags = terminatorFlagsList.join(' ')
 
                   def terminatorLinker = [
                       '-fuse-ld=lld',
@@ -272,15 +291,17 @@ jobs:
 
                   if (android.externalNativeBuild?.cmake?.path != null) {
                       android.defaultConfig.externalNativeBuild.cmake.with {
-                          cFlags += " ${terminatorFlags}"
-                          cppFlags += " ${terminatorFlags}"
-                          arguments '-DANDROID_STL=c++_static',
-                                    '-DANDROID_ARM_NEON=TRUE',
-                                    '-DCMAKE_BUILD_TYPE=Release',
-                                    "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
-                                    "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
-                                    "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
-                                    "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
+                          cFlags.addAll(terminatorFlagsList)
+                          cppFlags.addAll(terminatorFlagsList)
+                          arguments.addAll([
+                              '-DANDROID_STL=c++_static',
+                              '-DANDROID_ARM_NEON=TRUE',
+                              '-DCMAKE_BUILD_TYPE=Release',
+                              "-DCMAKE_C_FLAGS_RELEASE=${terminatorFlags}",
+                              "-DCMAKE_CXX_FLAGS_RELEASE=${terminatorFlags}",
+                              "-DCMAKE_SHARED_LINKER_FLAGS=${terminatorLinker}",
+                              "-DCMAKE_MODULE_LINKER_FLAGS=${terminatorLinker}"
+                          ])
                       }
                   }
               }
